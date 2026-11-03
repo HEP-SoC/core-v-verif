@@ -235,16 +235,22 @@ interface uvma_obi_memory_if #(
    //==============================================================================================
    // Asynchronous Reset Helpers
    //==============================================================================================
-   function void force_idle_nets(bit is_1p2_or_higher);
+   // Each mode only forces the nets it drives, the others are driven by the DUT
+   function void force_mstr_idle_nets(bit is_1p2_or_higher);
       force req = 1'b0;
-      force gnt = 1'b0;
-      force rvalid = 1'b0;
       force rready = 1'b0;
       if (is_1p2_or_higher) begin
          force reqpar = 1'b1;
+         force rreadypar = 1'b1;
+      end
+   endfunction
+
+   function void force_slv_idle_nets(bit is_1p2_or_higher);
+      force gnt = 1'b0;
+      force rvalid = 1'b0;
+      if (is_1p2_or_higher) begin
          force gntpar = 1'b1;
          force rvalidpar = 1'b1;
-         force rreadypar = 1'b1;
       end
    endfunction
 

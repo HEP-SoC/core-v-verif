@@ -191,8 +191,10 @@ task uvma_obi_memory_drv_c::run_phase(uvm_phase phase);
 
                      fork
                         begin : chan_a
-                           forever begin
-                              drv_slv_gnt();
+                           if (cfg.drv_mode == UVMA_OBI_MEMORY_MODE_SLV) begin
+                              forever begin
+                                 drv_slv_gnt();
+                              end
                            end
                         end
 
@@ -227,19 +229,28 @@ endtask : run_phase
 
 task uvma_obi_memory_drv_c::drv_idle();
 
-   if (cntxt.vif.reset_n !== 1'b1) begin
-      cntxt.vif.force_idle_nets(cfg.is_1p2_or_higher());
-   end 
-   
-   slv_mp.drv_slv_cb.gnt <= 1'b0;
-   slv_mp.drv_slv_cb.rvalid <= 1'b0;
-   if (cfg.is_1p2_or_higher()) begin
-      slv_mp.drv_slv_cb.gntpar <= 1'b1;
-      slv_mp.drv_slv_cb.rvalidpar <= 1'b1;
-   end
+   // Only the signals of the agent side are driven, the others are driven by the DUT
+   case (cfg.drv_mode)
+      UVMA_OBI_MEMORY_MODE_MSTR: begin
+         if (cntxt.vif.reset_n !== 1'b1) begin
+            cntxt.vif.force_mstr_idle_nets(cfg.is_1p2_or_higher());
+         end
+         drv_mstr_idle();
+      end
 
-   drv_mstr_idle();
-   drv_slv_idle();
+      UVMA_OBI_MEMORY_MODE_SLV: begin
+         if (cntxt.vif.reset_n !== 1'b1) begin
+            cntxt.vif.force_slv_idle_nets(cfg.is_1p2_or_higher());
+         end
+         slv_mp.drv_slv_cb.gnt <= 1'b0;
+         if (cfg.is_1p2_or_higher()) begin
+            slv_mp.drv_slv_cb.gntpar <= 1'b1;
+         end
+         drv_slv_idle();
+      end
+
+      default: `uvm_fatal("OBI_MEMORY_DRV", $sformatf("Invalid drv_mode: %0d", cfg.drv_mode))
+   endcase
 
 endtask : drv_idle
 
