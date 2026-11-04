@@ -39,9 +39,9 @@ class uvma_obi_memory_mstr_seq_item_c extends uvma_obi_memory_base_seq_item_c;
    
    // Metadata
    rand int unsigned  req_latency   ; ///< Number of cycles before req is asserted
-   rand int unsigned  rready_latency; ///< Number of cycles before rready is asserted after rvalid has been asserted
-   rand int unsigned  rready_hold   ; ///< Number of cycles to keep rready asserted after rvalid has been de-asserted
-   rand int unsigned  tail_length   ; ///< Number of idle cycles after rready has been de-asserted
+   rand int unsigned  rready_latency; ///< Number of cycles before rready is asserted after rvalid has been asserted. Only used if cfg.drv_mstr_max_outstanding is 1, rready is always asserted otherwise.
+   rand int unsigned  rready_hold   ; ///< Number of cycles to keep rready asserted after rvalid has been de-asserted. Only used if cfg.drv_mstr_max_outstanding is 1.
+   rand int unsigned  tail_length   ; ///< Number of idle cycles after rready has been de-asserted. Only used if cfg.drv_mstr_max_outstanding is 1.
    
    
    `uvm_object_utils_begin(uvma_obi_memory_mstr_seq_item_c)

@@ -44,6 +44,10 @@ class uvma_obi_memory_drv_c extends uvm_driver#(
    virtual uvma_obi_memory_if.active_mstr_mp  mstr_mp;
    virtual uvma_obi_memory_if.active_slv_mp   slv_mp ;
 
+   // 'mstr' mode with outstanding requests: responses of the granted requests, in order, carrying
+   // the sequence and transaction IDs of their request
+   uvma_obi_memory_mon_trn_c  mstr_rsp_q[$];
+
    `uvm_component_utils_begin(uvma_obi_memory_drv_c)
       `uvm_field_object(cfg  , UVM_DEFAULT)
       `uvm_field_object(cntxt, UVM_DEFAULT)
@@ -66,9 +70,27 @@ class uvma_obi_memory_drv_c extends uvm_driver#(
    extern virtual task run_phase(uvm_phase phase);
 
    /**
-    * Master mode: drive transactions in a loop
+    * Master mode: drive transactions in a loop, one at a time (cfg.drv_mstr_max_outstanding == 1)
     */
-   extern task drv_mstr_loop();
+   extern virtual task drv_mstr_loop();
+
+   /**
+    * Master mode with outstanding requests (cfg.drv_mstr_max_outstanding != 1): drives the A and R
+    * channels in parallel. The responses are always accepted.
+    */
+   extern virtual task drv_mstr_pipelined_loop();
+
+   /**
+    * Master mode with outstanding requests: drives the requests, back-to-back if the sequences
+    * allow it, and completes each sequence item on its grant.
+    */
+   extern virtual task drv_mstr_pipelined_chan_a();
+
+   /**
+    * Master mode with outstanding requests: sends the monitored response of each request to its
+    * sequence with put_response().
+    */
+   extern virtual task drv_mstr_pipelined_chan_r();
 
    /**
     * Slave mode: drive transactions in a loop
@@ -94,7 +116,12 @@ class uvma_obi_memory_drv_c extends uvm_driver#(
     * Drives the virtual interface's (cntxt.vif) signals using req's contents.
     * This task handles both READ and WRITE transactions.
     */
-   extern task drv_mstr_req(ref uvma_obi_memory_mstr_seq_item_c req);
+   extern virtual task drv_mstr_req(ref uvma_obi_memory_mstr_seq_item_c req);
+
+   /**
+    * Drives req and the address phase signals using req's contents.
+    */
+   extern virtual task drv_mstr_chan_a_req(ref uvma_obi_memory_mstr_seq_item_c req);
 
    /**
     * Drives the virtual interface's (cntxt.vif) signals using req's contents.
@@ -127,9 +154,15 @@ class uvma_obi_memory_drv_c extends uvm_driver#(
    extern task process_slv_rsp(ref uvma_obi_memory_slv_seq_item_c rsp, ref uvma_obi_memory_mon_trn_c req);
 
    /**
-    * TODO Describe uvma_obi_memory_drv_c::drv_mstr_idle()
+    * Drives the idle values of the A and R channel signals.
     */
-   extern task drv_mstr_idle();
+   extern virtual task drv_mstr_idle();
+
+   /**
+    * Drives the idle values of req and the address phase signals, also once a request is granted
+    * and no other one follows.
+    */
+   extern virtual task drv_mstr_chan_a_idle();
 
    /**
     * Drive an idle response state onto the OBI (including rvalid == 0)
@@ -200,7 +233,11 @@ task uvma_obi_memory_drv_c::run_phase(uvm_phase phase);
 
                         begin : chan_r
                            if (cfg.drv_mode == UVMA_OBI_MEMORY_MODE_MSTR) begin
-                              drv_mstr_loop();
+                              if (cfg.drv_mstr_max_outstanding == 1) begin
+                                 drv_mstr_loop();
+                              end else begin
+                                 drv_mstr_pipelined_loop();
+                              end
                            end else begin
                               drv_slv_loop();
                            end
@@ -219,6 +256,8 @@ task uvma_obi_memory_drv_c::run_phase(uvm_phase phase);
             // seq_item_port.item_done();
             req = null;
          end
+         // The requests lost in the reset get no response
+         mstr_rsp_q.delete();
          mon_trn_fifo.flush();
          drv_idle();
       end
@@ -283,6 +322,103 @@ task uvma_obi_memory_drv_c::drv_mstr_loop();
    end
 
 endtask : drv_mstr_loop
+
+
+task uvma_obi_memory_drv_c::drv_mstr_pipelined_loop();
+
+   // rready_latency, rready_hold and tail_length are not used
+   mstr_mp.drv_mstr_cb.rready <= 1'b1;
+   if (cfg.is_1p2_or_higher()) begin
+      mstr_mp.drv_mstr_cb.rreadypar <= 1'b0;
+   end
+
+   fork
+      drv_mstr_pipelined_chan_a();
+      drv_mstr_pipelined_chan_r();
+   join
+
+endtask : drv_mstr_pipelined_loop
+
+
+task uvma_obi_memory_drv_c::drv_mstr_pipelined_chan_a();
+
+   uvma_obi_memory_mstr_seq_item_c  mstr_req;
+   uvma_obi_memory_mon_trn_c        rsp;
+   int unsigned                     req_latency;
+   bit                              req_driven = 0;
+   bit                              granted;
+
+   forever begin
+      // 1. The request driven is granted on this clock edge: the sequence item is completed, and
+      //    its response is sent once the monitor sees it
+      granted = 0;
+      if (req_driven && (mstr_mp.drv_mstr_cb.gnt === 1'b1)) begin
+         rsp = uvma_obi_memory_mon_trn_c::type_id::create("rsp");
+         rsp.set_id_info(mstr_req);
+         mstr_rsp_q.push_back(rsp);
+         mstr_ap.write(mstr_req);
+         seq_item_port.item_done();
+         req        = null;
+         mstr_req   = null;
+         req_driven = 0;
+         granted    = 1;
+      end
+
+      // 2. Get the next req from the sequence, if the outstanding requests allow it
+      if ((mstr_req == null) && ((cfg.drv_mstr_max_outstanding == 0) || (mstr_rsp_q.size() < cfg.drv_mstr_max_outstanding))) begin
+         seq_item_port.try_next_item(req);
+         if (req != null) begin
+            prep_req(req);
+            if (!$cast(mstr_req, req)) begin
+               `uvm_fatal("OBI_MEMORY_DRV", $sformatf("Could not cast 'req' (%s) to 'mstr_req' (%s)", $typename(req), $typename(mstr_req)))
+            end
+            `uvm_info("OBI_MEMORY_DRV", $sformatf("Got mstr_req:\n%s", mstr_req.sprint()), UVM_HIGH)
+            req_latency = mstr_req.req_latency;
+         end
+      end
+
+      // 3. Drive it after req_latency cycles
+      if ((mstr_req != null) && !req_driven) begin
+         if (req_latency == 0) begin
+            drv_mstr_chan_a_req(mstr_req);
+            req_driven = 1;
+         end
+         else begin
+            req_latency--;
+         end
+      end
+
+      // 4. Only once it is known that no other request follows: conflicting drives of a clocking
+      //    block output in the same time step result in X
+      if (granted && !req_driven) begin
+         drv_mstr_chan_a_idle();
+      end
+
+      @(mstr_mp.drv_mstr_cb);
+   end
+
+endtask : drv_mstr_pipelined_chan_a
+
+
+task uvma_obi_memory_drv_c::drv_mstr_pipelined_chan_r();
+
+   uvma_obi_memory_mon_trn_c  slv_rsp;
+   uvma_obi_memory_mon_trn_c  rsp;
+
+   forever begin
+      wait_for_rsp(slv_rsp);
+      if (mstr_rsp_q.size() == 0) begin
+         `uvm_error("OBI_MEMORY_DRV", $sformatf("Response without a granted request:\n%s", slv_rsp.sprint()))
+         continue;
+      end
+
+      // The sequence and transaction IDs are not copied
+      rsp = mstr_rsp_q.pop_front();
+      rsp.copy(slv_rsp);
+      seq_item_port.put_response(rsp);
+   end
+
+endtask : drv_mstr_pipelined_chan_r
 
 
 task uvma_obi_memory_drv_c::drv_slv_loop();
@@ -366,53 +502,20 @@ endtask : prep_req
 // TODO: this task is yet to be fully tested as the CV32E4 cores are always the OBI bus master.
 task uvma_obi_memory_drv_c::drv_mstr_req(ref uvma_obi_memory_mstr_seq_item_c req);
 
-   if (req.access_type != UVMA_OBI_MEMORY_ACCESS_READ && req.access_type != UVMA_OBI_MEMORY_ACCESS_WRITE) begin
-     `uvm_fatal("OBI_MEMORY_DRV", $sformatf("Invalid access_type: %0d", req.access_type))
-   end
-
    // Req Latency cycles
    repeat (req.req_latency) begin
       @(mstr_mp.drv_mstr_cb);
    end
 
    // Address phase
-   mstr_mp.drv_mstr_cb.req <= 1'b1;
-   if (cfg.is_1p2_or_higher()) begin
-      mstr_mp.drv_mstr_cb.reqpar <= 1'b0;
-   end
-   mstr_mp.drv_mstr_cb.we  <= req.access_type;
-   for (int unsigned ii=0; ii<cfg.addr_width; ii++) begin
-      mstr_mp.drv_mstr_cb.addr[ii] <= req.address[ii];
-   end
-   for (int unsigned ii=0; ii<(cfg.data_width/8); ii++) begin
-      mstr_mp.drv_mstr_cb.be[ii] <= req.be[ii];
-   end
-   for (int unsigned ii=0; ii<cfg.auser_width; ii++) begin
-      mstr_mp.drv_mstr_cb.auser[ii] <= req.auser[ii];
-   end
-   for (int unsigned ii=0; ii<cfg.id_width; ii++) begin
-      mstr_mp.drv_mstr_cb.aid[ii] <= req.id[ii];
-   end
-
-   // Handle WRITE
-   if (req.access_type == UVMA_OBI_MEMORY_ACCESS_WRITE) begin
-       for (int unsigned ii=0; ii<cfg.data_width; ii++) begin
-          mstr_mp.drv_mstr_cb.wdata[ii] <= req.wdata[ii];
-       end
-       for (int unsigned ii=0; ii<cfg.wuser_width; ii++) begin
-          mstr_mp.drv_mstr_cb.wuser[ii] <= req.wuser[ii];
-       end
-   end
+   drv_mstr_chan_a_req(req);
 
    // Wait for grant
    do begin
       @(mstr_mp.drv_mstr_cb);
    end while (mstr_mp.drv_mstr_cb.gnt !== 1'b1);
 
-   mstr_mp.drv_mstr_cb.req <= 1'b0;
-   if (cfg.is_1p2_or_higher()) begin
-      mstr_mp.drv_mstr_cb.reqpar <= 1'b1;
-   end
+   drv_mstr_chan_a_idle();
 
    // Wait for rvalid
    if (mstr_mp.drv_mstr_cb.rvalid !== 1'b1) begin
@@ -447,6 +550,43 @@ task uvma_obi_memory_drv_c::drv_mstr_req(ref uvma_obi_memory_mstr_seq_item_c req
    end
 
 endtask : drv_mstr_req
+
+
+task uvma_obi_memory_drv_c::drv_mstr_chan_a_req(ref uvma_obi_memory_mstr_seq_item_c req);
+
+   if (req.access_type != UVMA_OBI_MEMORY_ACCESS_READ && req.access_type != UVMA_OBI_MEMORY_ACCESS_WRITE) begin
+     `uvm_fatal("OBI_MEMORY_DRV", $sformatf("Invalid access_type: %0d", req.access_type))
+   end
+
+   mstr_mp.drv_mstr_cb.req <= 1'b1;
+   if (cfg.is_1p2_or_higher()) begin
+      mstr_mp.drv_mstr_cb.reqpar <= 1'b0;
+   end
+   mstr_mp.drv_mstr_cb.we  <= req.access_type;
+   for (int unsigned ii=0; ii<cfg.addr_width; ii++) begin
+      mstr_mp.drv_mstr_cb.addr[ii] <= req.address[ii];
+   end
+   for (int unsigned ii=0; ii<(cfg.data_width/8); ii++) begin
+      mstr_mp.drv_mstr_cb.be[ii] <= req.be[ii];
+   end
+   for (int unsigned ii=0; ii<cfg.auser_width; ii++) begin
+      mstr_mp.drv_mstr_cb.auser[ii] <= req.auser[ii];
+   end
+   for (int unsigned ii=0; ii<cfg.id_width; ii++) begin
+      mstr_mp.drv_mstr_cb.aid[ii] <= req.id[ii];
+   end
+
+   // Handle WRITE
+   if (req.access_type == UVMA_OBI_MEMORY_ACCESS_WRITE) begin
+       for (int unsigned ii=0; ii<cfg.data_width; ii++) begin
+          mstr_mp.drv_mstr_cb.wdata[ii] <= req.wdata[ii];
+       end
+       for (int unsigned ii=0; ii<cfg.wuser_width; ii++) begin
+          mstr_mp.drv_mstr_cb.wuser[ii] <= req.wuser[ii];
+       end
+   end
+
+endtask : drv_mstr_chan_a_req
 
 
 task uvma_obi_memory_drv_c::drv_slv_req(ref uvma_obi_memory_slv_seq_item_c req);
@@ -546,11 +686,20 @@ endtask : process_slv_rsp
 
 task uvma_obi_memory_drv_c::drv_mstr_idle();
 
-   mstr_mp.drv_mstr_cb.req    <= '0;
+   drv_mstr_chan_a_idle();
    mstr_mp.drv_mstr_cb.rready <= '0;
    if (cfg.is_1p2_or_higher()) begin
-      mstr_mp.drv_mstr_cb.reqpar    <= 1'b1;
       mstr_mp.drv_mstr_cb.rreadypar <= 1'b1;
+   end
+
+endtask : drv_mstr_idle
+
+
+task uvma_obi_memory_drv_c::drv_mstr_chan_a_idle();
+
+   mstr_mp.drv_mstr_cb.req <= '0;
+   if (cfg.is_1p2_or_higher()) begin
+      mstr_mp.drv_mstr_cb.reqpar <= 1'b1;
    end
 
    case (cfg.drv_idle)
@@ -603,7 +752,7 @@ task uvma_obi_memory_drv_c::drv_mstr_idle();
       default: `uvm_fatal("OBI_MEMORY_DRV", $sformatf("Invalid drv_idle: %0d", cfg.drv_idle))
    endcase
 
-endtask : drv_mstr_idle
+endtask : drv_mstr_chan_a_idle
 
 
 task uvma_obi_memory_drv_c::drv_slv_idle();

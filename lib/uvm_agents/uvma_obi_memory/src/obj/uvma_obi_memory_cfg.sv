@@ -56,6 +56,11 @@ class uvma_obi_memory_cfg_c extends uvm_object;
    rand uvma_obi_memory_mode_enum       drv_mode   ;
    rand uvma_obi_memory_drv_idle_enum   drv_idle   ;
 
+   // 'mstr' mode: maximum number of granted requests waiting for their response, 0 for no limit.
+   // With 1, a sequence item is completed on its response, with its rdata. Otherwise, it is
+   // completed on its grant, and the monitored response is sent with put_response().
+   rand int unsigned                    drv_mstr_max_outstanding = 1;
+
    rand bit                                       drv_slv_gnt;
    rand uvma_obi_memory_drv_slv_gnt_mode_enum     drv_slv_gnt_mode;
    rand int unsigned                              drv_slv_gnt_fixed_latency;
@@ -114,6 +119,7 @@ class uvma_obi_memory_cfg_c extends uvm_object;
       `uvm_field_int (                        write_enabled, UVM_DEFAULT | UVM_DEC)
       `uvm_field_enum(uvma_obi_memory_mode_enum               , drv_mode                      , UVM_DEFAULT)
       `uvm_field_enum(uvma_obi_memory_drv_idle_enum           , drv_idle                      , UVM_DEFAULT)
+      `uvm_field_int (                                          drv_mstr_max_outstanding      , UVM_DEFAULT | UVM_DEC)
       `uvm_field_int (                                          drv_slv_gnt                   , UVM_DEFAULT)
       `uvm_field_enum(uvma_obi_memory_drv_slv_gnt_mode_enum   , drv_slv_gnt_mode              , UVM_DEFAULT)
       `uvm_field_int (                                          drv_slv_gnt_fixed_latency     , UVM_DEFAULT)
@@ -161,6 +167,7 @@ class uvma_obi_memory_cfg_c extends uvm_object;
       soft read_enabled                   == 1;
       soft drv_mode                       == UVMA_OBI_MEMORY_MODE_MSTR;
       soft drv_idle                       == UVMA_OBI_MEMORY_DRV_IDLE_ZEROS;
+      soft drv_mstr_max_outstanding       == 1;
       soft drv_slv_gnt                    == 1;
       soft drv_slv_gnt_fixed_latency      == uvma_obi_memory_default_drv_slv_gnt_fixed_latency;
       soft drv_slv_gnt_random_latency_min == uvma_obi_memory_default_drv_slv_gnt_random_latency_min;
